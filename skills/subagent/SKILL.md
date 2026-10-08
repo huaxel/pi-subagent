@@ -5,7 +5,7 @@ description: Spawn and communicate with observable Pi subagents for second opini
 
 # Subagent
 
-Use the `subagent` CLI to delegate work to a separate Pi process with its own context and tmux session. Managed subagents cannot spawn nested subagents, and this skill is not loaded into their sessions.
+Use the `subagent` CLI to delegate work to a separate Pi process with its own context and Herdr pane. Managed subagents cannot spawn nested subagents, and this skill is not loaded into their sessions. Use these primitives instead of Shepherdr during this local trial. Delegate only when useful; no profiles are required. Give implementation writers dedicated worktrees with `--cwd`.
 
 ## Spawn
 
@@ -53,7 +53,7 @@ Three additional built-in tools are available but off by default:
 - `--no-prompt-templates` - Disable prompt-template commands. Usually unnecessary, but useful when testing a minimal child environment.
 - `--no-context-files` - Ignore repository instruction files such as `AGENTS.md` and `CLAUDE.md`. Use only when those instructions would bias an independent investigation. Do not use for implementation unless intentionally bypassing repository guidance.
 
-Spawn prints a random handle and the exact tmux attach command. Keep the handle for later commands. Subagents persist after their current turn completes: `wait`, completion, and becoming idle do not terminate them. They survive `/reload`. When the spawning Pi session quits or is replaced, they are suspended and relaunched idle with their history when that session is resumed. They are only removed by `subagent stop`.
+Spawn prints a random handle and the Herdr pane ID. Keep the handle for later commands. Subagents persist after their current turn completes: `wait`, completion, and becoming idle do not terminate them. They survive `/reload`. When the spawning Pi session quits or is replaced, they are suspended with their history retained. Reopening the parent does not relaunch them; resume explicitly. `subagent stop` releases the pane but retains the transcript and metadata. Reopen it with `subagent resume <handle>`. Only an explicitly authorized `subagent purge <handle> --confirm` deletes history.
 
 ## Inspect and wait
 
@@ -65,7 +65,7 @@ subagent wait <handle>
 
 Run `subagent list` at any time to rediscover active subagents and their handles, names, and current states if you no longer remember them.
 
-`wait` follows the durable session state and prints the latest final assistant response. Run it directly so the bash tool returns that response; do not redirect it to a file or pipe it unless the user explicitly asks for an artifact. Do not infer completion from captured terminal text. Set the bash timeout above `wait`'s default 1800-second deadline.
+`wait` follows the durable session state and prints the latest final assistant response. Each spawn/send prints an assignment ID. `wait` snapshots the current assignment and returns only its correlated result, not a previous idle-turn answer. Use `wait <handle> --task <id>` for an earlier result. Resume clears the current assignment. Run it directly so the bash tool returns that response; do not redirect it to a file or pipe it unless the user explicitly asks for an artifact. Do not infer completion from captured terminal text. Set the bash timeout above `wait`'s default 1800-second deadline.
 
 ## Communicate
 
@@ -80,7 +80,7 @@ subagent send <handle> "message"
 subagent send <handle> --follow-up "message"
 ```
 
-Names are 1–64 characters and need not be unique. Messages use the subagent extension's control inbox; do not use `tmux send-keys`.
+Names are 1–64 characters and need not be unique. Messages use the subagent extension's control inbox; do not use raw terminal input for steering.
 
 ## Stop
 
@@ -88,6 +88,35 @@ Names are 1–64 characters and need not be unique. Messages use the subagent ex
 subagent stop <handle>
 ```
 
-Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This terminates tmux and removes the run transcript and metadata. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
+Explicitly stop every subagent when it is no longer needed; do not leave completed subagents running idle. This closes only the task-owned Herdr pane and retains its transcript and metadata. Keep the human’s current participation and pending work in mind before stopping. Never stop a pre-existing agent. Keep an idle subagent alive only when concrete follow-up work is expected, then stop it afterward.
 
-The interactive `/subagent` command lists active subagents spawned by the current Pi session. Selecting one suspends the current Pi TUI and attaches to its tmux session; detaching returns to the parent Pi. When the parent already runs inside tmux, selection switches the current tmux client instead.
+The interactive `/subagent` command lists active subagents spawned by the current Pi session. Selecting one focuses its Herdr pane so the human can inspect or participate in the real conversation. The parent remains visible in its own pane. Background spawning does not change focus. Do not overwrite human drafts; steering and follow-ups use the control inbox, not terminal input.
+
+## Retained conversations
+
+```sh
+subagent resume <handle>
+```
+
+Resume opens a new sibling pane with the full retained history, idle. `list` includes released runs. `status` prints the transcript path. Do not automatically purge retained history. Only on explicit human authorization:
+
+```sh
+subagent purge <handle> --confirm
+```
+
+## Notifications and pending work
+
+Completion and attention are pushed to the parent conversation; stay available
+for human discussion instead of blocking on `wait` unless the result is needed
+immediately. Notifications identify assignments and can repeat after a crash.
+
+`subagent pending <handle>` displays retained queued/interrupted messages. Stop,
+resume and detected parent loss hold pending work instead of silently replaying
+it. Explicitly send a new assignment to restart desired work. Inspect recovery
+warnings in `status`/`list`; never infer that a missing/replaced pane is safe to
+close. There are no profiles or fleet policies.
+
+If a worker's pane now hosts a different human conversation, do not close it.
+`subagent detach <handle>` releases only retained bookkeeping when foreign/missing
+identity is provable; then `resume` can open a new worker for the original history.
+An uncertain ownership check is a blocker, not permission to close a pane.

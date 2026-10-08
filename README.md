@@ -2,22 +2,20 @@
 
 Observable, persistent Pi subagents for independent reviews, investigations, and delegated implementation.
 
-Each subagent runs in its own tmux session with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
+Each subagent runs in its own Herdr pane with a dedicated Pi JSONL session. The parent can inspect status, wait for durable results, steer active work, queue follow-ups, or attach directly to the child TUI.
 
 ## Requirements
 
 - Pi
 - Node.js 22.19 or newer
-- tmux
+- Herdr (run Pi inside a Herdr-managed pane)
+- Linux with `flock` (this local fork’s lock/process-identity backend)
 
 ## Install
 
-Clone into Pi's global extension directory and expose the CLI on `PATH`:
-
-```sh
-git clone git@github.com:earendil-works/pi-subagent.git ~/.pi/agent/extensions/subagent
-ln -s ../extensions/subagent/subagent.ts ~/.pi/agent/bin/subagent
-```
+This local fork lives at `~/projects/pi-extensions/pi-subagent`. Add its absolute
+path to `packages` in Pi settings and put `subagent.ts` on PATH as `subagent`.
+No npm install or tmux is required.
 
 Run `/reload` in an existing Pi session. The extension contributes its bundled skill automatically.
 
@@ -68,7 +66,7 @@ subagent stop a1b2c3
 subagent list
 ```
 
-Use `/subagent` to select and attach to an active child. The status widget shows active names (or handles for unnamed runs) and their current state.
+Use `/subagent` to select and focus an active child’s Herdr pane. The status widget shows active names (or handles for unnamed runs) and their current state.
 
 ## Isolation
 
@@ -80,4 +78,72 @@ Optional spawn flags:
 - `--no-prompt-templates`: disable prompt templates
 - `--no-context-files`: ignore repository instruction files
 
-Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Resuming that parent session relaunches them idle with their full history. `subagent stop` removes a run permanently.
+Nested subagents are disabled. Child sessions do not receive the subagent skill. Children survive `/reload`. When their spawning Pi session quits or is replaced, running children are suspended: the process stops, but transcript and metadata are kept. Reopening the parent restores bookkeeping without relaunching helpers; resume each retained conversation explicitly. `subagent stop` closes the task-owned pane and retains the transcript and metadata. `subagent resume <handle>` reopens the retained session idle. `subagent purge <handle> --confirm` permanently deletes a stopped run; use only with explicit human authorization.
+
+## Local fork scope
+
+Based on https://github.com/badlogic/pi-subagent (upstream remote remains `origin`).
+The `herdr-local` branch replaces the tmux transport with sibling Herdr panes,
+uses returned opaque pane IDs, preserves UI focus on spawn, and verifies child
+session ownership before closing. No profile catalogue or routing policy is added.
+Per-task provider/model/thinking overrides and the upstream inbox bridge remain.
+
+Runs live under `$PI_CODING_AGENT_DIR/subagents-herdr` (or `~/.pi/agent/subagents-herdr`),
+separate from upstream tmux runs. Released runs remain in `list`; `/subagent` shows
+live conversations only. Parent shutdown suspends live children without deleting
+history; reopening that parent does not relaunch them automatically. Explicitly stopped children
+stay stopped until `resume`.
+
+### Checks
+
+```sh
+node --test test/*.test.ts
+deno check --node-modules-dir=auto subagent.ts shared.ts herdr.ts
+```
+
+### Trial rollback
+
+Remove the local package from Pi settings; re-enable the existing
+`npm:@howaboua/pi-shepherdr` entry by removing its empty resource filters, then run
+`/reload`. Stop trial-owned workers first; their transcripts remain available.
+The local fork and CLI can remain on disk without being loaded.
+
+Management commands require the owning `PI_SESSION_ID`, normally injected into
+Pi’s bash tool. Cross-session mutation is refused; direct shell invocations must
+explicitly set that parent identity. Metadata paths are validated before deletion.
+
+Ownership normally uses Herdr's reported Pi session path. Isolated children with
+`--no-extensions` use the bridge PID plus Linux process start ticks, checked
+against the pane's foreground process. This fallback is Linux-only; other
+platforms require Herdr session reporting. Launch waits for bridge registration
+before returning. The parent widget polls asynchronously so a slow Herdr response
+does not block the editor.
+
+## Assignment and recovery semantics
+
+`spawn` and `send` return a durable assignment ID. `wait <handle>` waits for the
+assignment current when invoked, not just an idle worker or its latest old answer.
+Use `wait <handle> --task <id>` to retrieve a specific earlier result. Resuming
+clears the current assignment: it opens idle and `wait` requires a new task or
+an explicit ID. Text files passed with `--file` are included in the tagged input.
+
+Pending/submitted messages are retained as **held** on stop/resume or detected
+parent loss. `subagent pending <handle>` displays them, including migrated legacy
+inbox files. They never replay automatically; explicitly send any work you want
+to restart. Acceptance/completion use tagged user inputs and persisted response
+IDs on the active transcript branch. Steering inputs combined into one turn can
+share that turn's response; separate follow-up turns retain separate answers.
+
+Parents receive completion and attention messages asynchronously (including RPC
+mode), with full transcript paths. Notification delivery is at-least-once around
+crashes; a task ID allows deduplication. Metadata writes and lifecycle actions use
+kernel-released `flock` locks; old child generations cannot overwrite a new one.
+Unexpected process loss/replaced panes surface as attention with held assignments.
+Orphaned conversations are not automatically killed: inspect and release them
+when safe. Ownership uncertainty never authorizes closing another conversation.
+
+If a human replaces a child’s session, the original transcript reference stays
+immutable and pending assignments are held. A failed stop clears its coordination
+freeze and exposes attention. `subagent detach <handle>` can release bookkeeping
+for a provably foreign or missing pane without closing it; ambiguous ownership is
+refused. Resume/stop/purge all require fresh metadata under one lifecycle lock.

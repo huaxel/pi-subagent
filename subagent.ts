@@ -1,27 +1,27 @@
 #!/usr/bin/env node
 
+import type { RunMetadata } from "./shared.ts";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-	assistantText,
+	detachRun,
+	parentIdentity,
+	lifecycleAttention,
+	enqueueTask,
 	effectiveRunState,
 	getRunsDir,
 	inboxDir,
 	launchRun,
 	listRuns,
-	readLatestAssistant,
 	readMetadata,
-	removeRunDir,
+	purgeRun,
 	runDisplayName,
 	isValidRunName,
-	type InboxMessage,
-	type RunMetadata,
-	tmuxSessionExists,
+	runIsLive,
+	releaseRun,
 	updateMetadata,
-	waitForRunShutdown,
 	writeMetadata,
 } from "./shared.ts";
 
@@ -37,11 +37,15 @@ function usage(): never {
   subagent spawn [--name <name>] [--provider <provider>] [--model <model>] [--thinking <level>]
     [--cwd <dir>] [--tools <names>] [--no-extensions] [--no-skills]
     [--no-prompt-templates] [--no-context-files] (--prompt <text> | --file <path>)...
+  subagent detach <handle>
+  subagent pending <handle>
   subagent status <handle>
   subagent rename <handle> <name>
   subagent send <handle> [--follow-up] <message>
-  subagent wait <handle> [--timeout <seconds>]
+  subagent wait <handle> [--task <id>] [--timeout <seconds>]
   subagent stop <handle>
+  subagent resume <handle>
+  subagent purge <handle> --confirm
   subagent list`);
 }
 
@@ -65,6 +69,9 @@ function runDirForHandle(handle: string): string {
 function getRun(handle: string): RunMetadata {
 	const metadata = readMetadata(runDirForHandle(handle));
 	if (!metadata) fail(`Unknown subagent: ${handle}`);
+	if (!process.env.PI_SESSION_ID) fail("PI_SESSION_ID is required; run this command through the owning Pi session");
+	if (metadata.parentSessionId !== process.env.PI_SESSION_ID)
+		fail(`Subagent ${handle} belongs to another parent session`);
 	return metadata;
 }
 
@@ -79,6 +86,8 @@ function generateHandle(): string {
 
 function spawnSubagent(args: string[]): void {
 	if (process.env.PI_SUBAGENT_RUN_DIR) fail("Nested subagents are disabled");
+	if (!process.env.PI_SESSION_ID) fail("PI_SESSION_ID is required; spawn through a Pi session");
+	if (process.env.HERDR_ENV !== "1") fail("Subagents require a Herdr-managed pane (HERDR_ENV=1)");
 	let name: string | undefined;
 	let provider = process.env.PI_PROVIDER;
 	let model = process.env.PI_MODEL;
@@ -158,25 +167,27 @@ function spawnSubagent(args: string[]): void {
 	const handle = generateHandle();
 	const runDir = runDirForHandle(handle);
 	const sessionFile = join(runDir, "session.jsonl");
-	const tmuxSession = `pi-subagent-${handle}`;
 	mkdirSync(inboxDir(runDir), { recursive: true, mode: 0o700 });
 	writeFileSync(sessionFile, "", { mode: 0o600 });
 
 	const launchArgs: string[] = [];
 	if (tools) launchArgs.push("--tools", tools);
-	if (noExtensions) launchArgs.push("--no-extensions", "--extension", extensionPath);
+	if (noExtensions) launchArgs.push("--no-extensions");
+	launchArgs.push("--extension", extensionPath);
 	if (noSkills) launchArgs.push("--no-skills");
 	if (noPromptTemplates) launchArgs.push("--no-prompt-templates");
 	if (noContextFiles) launchArgs.push("--no-context-files");
 
+	const parent = parentIdentity(process.env.PI_SESSION_ID);
 	const now = new Date().toISOString();
 	const metadata: RunMetadata = {
 		version: 1,
 		handle,
 		name,
 		parentSessionId: process.env.PI_SESSION_ID || undefined,
+		parentPid: parent.pid,
+		parentStartTime: parent.startTime,
 		parentSessionFile: process.env.PI_SESSION_FILE || undefined,
-		tmuxSession,
 		runDir,
 		sessionFile,
 		cwd,
@@ -191,23 +202,23 @@ function spawnSubagent(args: string[]): void {
 	};
 	writeMetadata(metadata);
 
-	const initialArgs = files.map((file) => `@${file}`);
+	const initialArgs = files.map((file) => `File: ${file}\n${readFileSync(file, "utf8")}`);
 	if (prompts.length > 0) initialArgs.push(`Task:\n${prompts.join("\n\n")}`);
 	try {
 		launchRun(metadata, initialArgs);
 	} catch (error) {
-		removeRunDir(runDir);
+		updateMetadata(runDir, { state: "error", error: error instanceof Error ? error.message : String(error) });
 		throw error;
 	}
 
-	process.stdout.write(`Spawned ${runDisplayName(metadata)}\nState: busy\nAttach: tmux attach -t ${tmuxSession}\n`);
+	process.stdout.write(`Spawned ${runDisplayName(metadata)}\nTask: ${readMetadata(runDir)?.waitTaskId}\nState: busy\nPane: ${readMetadata(runDir)?.paneId ?? "unavailable"}\n`);
 }
 
 function statusSubagent(args: string[]): void {
 	if (args.length !== 1) usage();
 	const metadata = getRun(args[0]);
 	process.stdout.write(
-		`${runDisplayName(metadata)}: ${effectiveRunState(metadata)} (${metadata.provider}/${metadata.model}, ${metadata.thinking})\nAttach: tmux attach -t ${metadata.tmuxSession}\n`,
+		`${runDisplayName(metadata)}: ${effectiveRunState(metadata)} (${metadata.provider}/${metadata.model}, ${metadata.thinking})\nPane: ${metadata.paneId ?? "released"}\nTranscript: ${metadata.sessionFile}\nTask: ${metadata.waitTaskId ?? "none (idle resume)"}\nAttention: ${lifecycleAttention(metadata) ?? "none"}\n`,
 	);
 }
 
@@ -233,20 +244,13 @@ function sendSubagent(args: string[]): void {
 	const message = messageParts.join(" ").trim();
 	if (!message) fail("send requires a message");
 	const metadata = getRun(handle);
-	if (!tmuxSessionExists(metadata.tmuxSession)) fail(`${handle} is not running`);
+	if (!runIsLive(metadata)) fail(`${handle} is not running`);
 
-	const queueDir = inboxDir(metadata.runDir);
-	mkdirSync(queueDir, { recursive: true, mode: 0o700 });
-	const id = `${Date.now()}-${randomBytes(4).toString("hex")}`;
-	const target = join(queueDir, `${id}.json`);
-	const temporary = `${target}.tmp`;
-	const payload: InboxMessage = { message, delivery: followUp ? "followUp" : "auto" };
-	writeFileSync(temporary, `${JSON.stringify(payload)}\n`, { encoding: "utf8", mode: 0o600 });
-	renameSync(temporary, target);
+	const task = enqueueTask(metadata.runDir, message, followUp ? "followUp" : "auto");
 
 	const state = effectiveRunState(metadata);
 	const verb = followUp && state === "busy" ? "Queued follow-up for" : state === "idle" ? "Prompted" : "Steered";
-	process.stdout.write(`${verb} ${runDisplayName(metadata)}\n`);
+	process.stdout.write(`${verb} ${runDisplayName(metadata)}\nTask: ${task.id}\n`);
 }
 
 function parseTimeout(args: string[]): number {
@@ -260,24 +264,25 @@ function parseTimeout(args: string[]): number {
 async function waitSubagent(args: string[]): Promise<void> {
 	const handle = args.shift();
 	if (!handle) usage();
+	let taskId: string | undefined;
+	const taskFlag = args.indexOf("--task");
+	if (taskFlag >= 0) { taskId = valueAfter(args, taskFlag, "--task"); args.splice(taskFlag, 2); }
 	const timeoutSeconds = parseTimeout(args);
+	taskId ??= getRun(handle).waitTaskId;
+	if (!taskId) fail("No current assignment; resume is idle. Send a task or use --task <id> for an earlier result");
 	const deadline = Date.now() + timeoutSeconds * 1000;
-
 	while (Date.now() < deadline) {
 		const metadata = getRun(handle);
-		const pending = existsSync(inboxDir(metadata.runDir))
-			? readdirSync(inboxDir(metadata.runDir)).some((file) => file.endsWith(".json"))
-			: false;
-		const state = effectiveRunState(metadata);
-		if (state === "error") fail(metadata.error || `${handle} failed`);
-		if (state === "exited") fail(`${handle} exited before finishing`);
-		if (metadata.hasStarted && state === "idle" && !pending) {
-			const message = readLatestAssistant(metadata.sessionFile);
-			if (!message) fail(`${handle} finished without an assistant response`);
-			process.stdout.write(`${handle} finished\n\n${assistantText(message)}\n`);
-			if (message.stopReason === "error" || message.stopReason === "aborted") process.exitCode = 1;
+		const task = metadata.tasks?.find((entry) => entry.id === taskId);
+		if (!task) fail(`Unknown assignment: ${taskId}`);
+		if (task.status === "completed") {
+			process.stdout.write(`${handle} task ${task.id} finished\n\n${task.result}\n`);
+			if (task.failed) process.exitCode = 1;
 			return;
 		}
+		if (task.status === "held") fail(`Assignment ${task.id} is held after stop/resume; inspect with pending and explicitly resend`);
+		const state = effectiveRunState(metadata);
+		if (state === "error" || state === "exited") fail(metadata.error || `${handle} is not running; assignment retained`);
 		await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
 	}
 	fail(`Timed out after ${timeoutSeconds}s waiting for ${handle}`);
@@ -286,11 +291,26 @@ async function waitSubagent(args: string[]): Promise<void> {
 async function stopSubagent(args: string[]): Promise<void> {
 	if (args.length !== 1) usage();
 	const metadata = getRun(args[0]);
-	const wasRunning = tmuxSessionExists(metadata.tmuxSession);
-	spawnSync("tmux", ["kill-session", "-t", metadata.tmuxSession], { stdio: "ignore" });
-	if (wasRunning) await waitForRunShutdown(metadata.runDir);
-	removeRunDir(metadata.runDir);
-	process.stdout.write(`Stopped ${runDisplayName(metadata)}\n`);
+	releaseRun(metadata);
+	process.stdout.write(`Stopped ${runDisplayName(metadata)}; transcript retained: ${metadata.sessionFile}\n`);
+}
+
+function resumeSubagent(args: string[]): void {
+	if (process.env.PI_SUBAGENT_RUN_DIR) fail("Nested subagents are disabled");
+	if (args.length !== 1) usage();
+	const metadata = getRun(args[0]);
+	if (runIsLive(metadata)) fail(`${metadata.handle} is already running`);
+	if (!existsSync(metadata.sessionFile)) fail("Retained transcript is missing");
+	launchRun(metadata);
+	process.stdout.write(`Resumed ${runDisplayName(metadata)}\n`);
+}
+
+function purgeSubagent(args: string[]): void {
+	if (args.length !== 2 || args[1] !== "--confirm") fail("purge requires <handle> --confirm; this permanently deletes the transcript");
+	const metadata = getRun(args[0]);
+	if (runIsLive(metadata)) fail("Stop the subagent before purging");
+	purgeRun(metadata);
+	process.stdout.write(`Purged ${runDisplayName(metadata)}\n`);
 }
 
 function listSubagents(args: string[]): void {
@@ -302,7 +322,7 @@ function listSubagents(args: string[]): void {
 	}
 	for (const metadata of runs) {
 		process.stdout.write(
-			`${runDisplayName(metadata)}  ${effectiveRunState(metadata).padEnd(8)}  ${metadata.provider}/${metadata.model}  ${metadata.thinking}\n`,
+			`${runDisplayName(metadata)}  ${effectiveRunState(metadata).padEnd(8)}  ${metadata.provider}/${metadata.model}  ${metadata.thinking}${lifecycleAttention(metadata) ? `  ATTENTION: ${lifecycleAttention(metadata)}` : ""}\n`,
 		);
 	}
 }
@@ -314,6 +334,17 @@ async function main(): Promise<void> {
 		case "spawn":
 			spawnSubagent(args);
 			break;
+		case "detach":
+			if (args.length !== 1) usage();
+			detachRun(getRun(args[0]));
+			process.stdout.write("Detached retained run bookkeeping; no pane closed\n");
+			break;
+		case "pending": {
+			if (args.length !== 1) usage();
+			const run = getRun(args[0]);
+			for (const task of run.tasks ?? []) if (task.status !== "completed") process.stdout.write(`${task.id} ${task.status}\n${task.message}\n\n`);
+			break;
+		}
 		case "status":
 			statusSubagent(args);
 			break;
@@ -328,6 +359,12 @@ async function main(): Promise<void> {
 			break;
 		case "stop":
 			await stopSubagent(args);
+			break;
+		case "resume":
+			resumeSubagent(args);
+			break;
+		case "purge":
+			purgeSubagent(args);
 			break;
 		case "list":
 			listSubagents(args);
