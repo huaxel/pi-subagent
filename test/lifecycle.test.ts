@@ -53,6 +53,10 @@ console.log(JSON.stringify(error ? { error } : { result }));
 process.exitCode = error ? 1 : 0;
 `;
 	writeFileSync(join(bin, "herdr"), mock, { mode: 0o755 });
+	// The spawn preflight probes provider resolvability through the real pi
+	// CLI; a benign mock keeps tests hermetic. Tests that exercise the
+	// preflight's failure path overwrite this file.
+	writeFileSync(join(bin, "pi"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 	const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, MOCK_STATE: join(root, "state.json"),
 		PI_CODING_AGENT_DIR: root, HERDR_ENV: "1", HERDR_PANE_ID: "parent-pane", PI_SESSION_ID: "parent-session",
 		PI_PROVIDER: "test-provider", PI_MODEL: "test-model", PI_REASONING_LEVEL: "low" };
@@ -142,6 +146,20 @@ test("per-spawn model and tools overrides remain available", () => {
 		assert.equal(m.provider, "other"); assert.equal(m.model, "fast"); assert.equal(m.thinking, "high");
 		assert.ok(m.launchArgs.includes("read,grep,find,ls")); assert.ok(m.launchArgs.includes("--no-extensions"));
 	} finally { f.cleanup(); }
+});
+
+test("--no-extensions with an extension-provided provider fails fast instead of timing out at launch", () => {
+	const f = fixture();
+	try {
+		// Emulate the real pi's verdict for a provider that only an extension
+		// provides: with --no-extensions the child could never resolve it.
+		writeFileSync(join(f.root, "bin", "pi"), "#!/bin/sh\necho \"Error: Unknown provider \\\"openference\\\".\" >&2\nexit 1\n", { mode: 0o755 });
+		const result = f.run(["spawn", "--prompt", "task", "--provider", "openference", "--model", "some-model", "--no-extensions"]);
+		assert.notEqual(result.status, 0);
+		assert.match(result.stderr, /cannot be resolved with --no-extensions/);
+	}
+	// No pane was ever launched, so there is nothing to stop.
+	finally { f.cleanup(); }
 });
 
 test("missing parent identity and corrupted deletion paths fail closed", () => {

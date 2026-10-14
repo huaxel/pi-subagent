@@ -3,6 +3,7 @@
 import type { RunMetadata } from "./shared.ts";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -158,6 +159,16 @@ function spawnSubagent(args: string[]): void {
 
 	if (!provider) fail("No provider specified and PI_PROVIDER is not set");
 	if (!model) fail("No model specified and PI_MODEL is not set");
+	if (noExtensions) {
+		// With --no-extensions an extension-provided provider (a custom
+		// endpoint such as openference) cannot be resolved in the child; the
+		// Herdr launch would only surface that as a 30-second "timed out
+		// waiting for agent startup". Fail fast with the real cause.
+		const check = spawnSync("pi", ["--no-extensions", "auth", "check", "--provider", provider, "--model", model], { encoding: "utf8", timeout: 15000 });
+		const output = `${check.stdout ?? ""}${check.stderr ?? ""}`;
+		if (/Unknown provider/i.test(output))
+			fail(`Provider "${provider}" is provided by a pi extension and cannot be resolved with --no-extensions. Re-run without --no-extensions (a --tools allowlist already isolates the child), or pass a built-in provider via --provider/--model.`);
+	}
 	if (!VALID_THINKING_LEVELS.has(thinking)) fail(`Invalid thinking level: ${thinking}`);
 	if (tools !== undefined && !tools.split(",").some((name) => name.trim()))
 		fail("--tools requires at least one tool name");

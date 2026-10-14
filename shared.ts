@@ -363,9 +363,20 @@ function launchRunUnlocked(metadata: RunMetadata, initialArgs: string[]): void {
 	});
 	try {
 		herdr(["pane", "rename", paneId, metadata.name ?? `subagent-${metadata.handle}`]);
-		herdr(["agent", "start", `subagent-${metadata.handle}`, "--kind", "pi", "--pane", paneId,
-			"--", "--session", metadata.sessionFile, "--provider", metadata.provider, "--model", metadata.model,
-			"--thinking", metadata.thinking, ...(metadata.launchArgs ?? [])]);
+		// A fresh split pane's shell may not be at its prompt yet; Herdr
+		// reports that as "not an available shell". Retry briefly instead of
+		// failing the whole launch on the race.
+		for (let attempt = 0; ; attempt++) {
+			try {
+				herdr(["agent", "start", `subagent-${metadata.handle}`, "--kind", "pi", "--pane", paneId,
+					"--", "--session", metadata.sessionFile, "--provider", metadata.provider, "--model", metadata.model,
+					"--thinking", metadata.thinking, ...(metadata.launchArgs ?? [])]);
+				break;
+			} catch (error) {
+				if (attempt >= 4 || !(error instanceof Error) || !/not an available shell/i.test(error.message)) throw error;
+				Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+			}
+		}
 		const deadline = Date.now() + 5000;
 		let registered = false;
 		while (Date.now() < deadline) {
