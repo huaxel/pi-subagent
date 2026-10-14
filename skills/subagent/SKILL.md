@@ -48,7 +48,7 @@ Three additional built-in tools are available but off by default:
 
 ## Isolation flags
 
-- `--no-extensions` - Disable normal extension discovery. Use for an independent run that should not inherit unrelated extension behavior or extension-provided tools. The subagent control bridge is still explicitly loaded.
+- `--no-extensions` - Disable normal extension discovery. Use for an independent run that should not inherit unrelated extension behavior or extension-provided tools. The subagent control bridge is still explicitly loaded. **Provider caveat:** it also disables extensions that *provide* the inherited provider. If the current Pi session's provider is extension-provided (e.g. `openference`), the child cannot resolve it and the spawn fails fast (sub-second) with the real cause. In that case drop `--no-extensions` and isolate with a `--tools` allowlist instead — a read-only tool list is usually the isolation that actually matters. Spawn's preflight probes exact provider resolvability with the same flags before starting the child, so this failure mode is caught instantly rather than surfacing as a generic startup timeout.
 - `--no-skills` - Hide installed skills from the child. Use for tightly specified tasks that should rely only on the supplied prompt and files.
 - `--no-prompt-templates` - Disable prompt-template commands. Usually unnecessary, but useful when testing a minimal child environment.
 - `--no-context-files` - Ignore repository instruction files such as `AGENTS.md` and `CLAUDE.md`. Use only when those instructions would bias an independent investigation. Do not use for implementation unless intentionally bypassing repository guidance.
