@@ -28,13 +28,17 @@ else if (args[0] === 'pane' && args[1] === 'split') {
   state.panes[id] = { pane_id: id, env };
   result = { pane: state.panes[id] };
 } else if (args[0] === 'agent' && args[1] === 'start') {
-  const pane = state.panes[args[args.indexOf('--pane') + 1]];
-  const sessionFile = args[args.indexOf('--session') + 1];
-  pane.agent = 'pi'; pane.agent_session = { value: sessionFile };
-  const runDir = path.dirname(sessionFile);
-  const metaFile = path.join(runDir, 'metadata.json');
-  const meta = JSON.parse(fs.readFileSync(metaFile));
-  fs.writeFileSync(metaFile, JSON.stringify({ ...meta, childPid: 1, state: 'idle' }));
+  if (state.failStarts > 0) { state.failStarts--; error = { code: 'invalid_pane', message: 'not an available shell' }; }
+  else if (state.failStartWith) error = { code: 'invalid_pane', message: state.failStartWith };
+  else {
+    const pane = state.panes[args[args.indexOf('--pane') + 1]];
+    const sessionFile = args[args.indexOf('--session') + 1];
+    pane.agent = 'pi'; pane.agent_session = { value: sessionFile };
+    const runDir = path.dirname(sessionFile);
+    const metaFile = path.join(runDir, 'metadata.json');
+    const meta = JSON.parse(fs.readFileSync(metaFile));
+    fs.writeFileSync(metaFile, JSON.stringify({ ...meta, childPid: 1, state: 'idle' }));
+  }
 } else if (args[0] === 'agent' && args[1] === 'prompt') {
   const pane = state.panes[args[2]];
   const metaFile = path.join(path.dirname(pane.agent_session.value), 'metadata.json');
@@ -159,6 +163,31 @@ test("--no-extensions with an extension-provided provider fails fast instead of 
 		assert.match(result.stderr, /cannot be resolved with --no-extensions/);
 	}
 	// No pane was ever launched, so there is nothing to stop.
+	finally { f.cleanup(); }
+});
+
+test("agent-start 'not an available shell' is retried; other errors propagate immediately", () => {
+	const f = fixture();
+	try {
+		// Fail the first agent start with the fresh-pane race error; the launch
+		// must retry and succeed (the pane's shell is "at its prompt" by then).
+		writeFileSync(f.env.MOCK_STATE, JSON.stringify({ calls: [], panes: {}, n: 0, failStarts: 1 }));
+		const ok = f.run(["spawn", "--name", "retry", "--prompt", "task"]);
+		assert.equal(ok.status, 0, ok.stderr);
+		const calls = JSON.parse(readFileSync(f.env.MOCK_STATE, "utf8")).calls;
+		assert.equal(calls.filter((c: string[]) => c[0] === "agent" && c[1] === "start").length, 2);
+
+		// A non-race error must not be retried: one attempt, immediate failure.
+		const f2 = fixture();
+		try {
+			writeFileSync(f2.env.MOCK_STATE, JSON.stringify({ calls: [], panes: {}, n: 0, failStartWith: "boom: bad thing" }));
+			const bad = f2.run(["spawn", "--name", "noretry", "--prompt", "task"]);
+			assert.notEqual(bad.status, 0);
+			assert.match(bad.stderr, /boom: bad thing/);
+			const calls2 = JSON.parse(readFileSync(f2.env.MOCK_STATE, "utf8")).calls;
+			assert.equal(calls2.filter((c: string[]) => c[0] === "agent" && c[1] === "start").length, 1);
+		} finally { f2.cleanup(); }
+	}
 	finally { f.cleanup(); }
 });
 
